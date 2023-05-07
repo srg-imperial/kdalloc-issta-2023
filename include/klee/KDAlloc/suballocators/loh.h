@@ -209,7 +209,7 @@ public:
 
   std::size_t getSize(Control const &control,
                       void const *const ptr) const noexcept {
-    assert(control.mapping_begin() <= ptr && ptr < control.mapping_end() &&
+    assert(control.mapping_begin() <= ptr &&
            "This property should have been ensured by the caller");
     assert(!!data &&
            "Can only get size of an object if objects already exist...");

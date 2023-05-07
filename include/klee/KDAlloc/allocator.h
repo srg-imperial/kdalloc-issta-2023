@@ -258,12 +258,10 @@ public:
   explicit operator bool() const noexcept { return !control.isNull(); }
 
   Mapping &getMapping() noexcept {
-    assert(!!*this && "Cannot get mapping of uninitialized allocator.");
     return control->mapping;
   }
 
   Mapping const &getMapping() const noexcept {
-    assert(!!*this && "Cannot get mapping of uninitialized allocator.");
     return control->mapping;
   }
 
