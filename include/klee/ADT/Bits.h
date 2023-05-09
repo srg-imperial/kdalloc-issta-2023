@@ -10,10 +10,6 @@
 #ifndef KLEE_BITS_H
 #define KLEE_BITS_H
 
-#include "klee/Config/Version.h"
-
-#include "llvm/Support/DataTypes.h"
-
 #include <cassert>
 #include <cstddef>
 #include <cstdint>

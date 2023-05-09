@@ -10,7 +10,6 @@
 #ifndef KLEE_DEBUG_H
 #define KLEE_DEBUG_H
 
-#include "klee/Config/config.h"
 #include "llvm/Support/Debug.h"
 
 // We define wrappers around the LLVM DEBUG macros that are conditionalized on

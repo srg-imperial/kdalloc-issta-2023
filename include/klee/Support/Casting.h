@@ -10,8 +10,6 @@
 #ifndef KLEE_CASTING_H
 #define KLEE_CASTING_H
 
-#include "klee/Config/Version.h"
-
 #include "llvm/Support/Casting.h"
 
 namespace klee {
