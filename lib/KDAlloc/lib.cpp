@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cassert>
 #include <charconv>
+#include <cinttypes>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
