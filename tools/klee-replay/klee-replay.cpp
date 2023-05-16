@@ -9,9 +9,11 @@
 
 #include "klee-replay.h"
 #include "cli.h"
+#include "kconfig.h"
 
 #include "klee/ADT/KTest.h"
 
+#include <filesystem>
 #include <string>
 
 #include <assert.h>
@@ -162,7 +164,8 @@ static inline char *strip_root_dir(char *const executable,
   return executable + strlen(rootdir);
 }
 
-static void run_monitored(char *executable, int argc, char **argv) {
+static void run_monitored(char *executable, int argc, char **argv,
+                          KConfig const &kconfig) {
   int pid;
   const char *t = getenv("KLEE_REPLAY_TIMEOUT");
   if (!t)
@@ -196,8 +199,18 @@ static void run_monitored(char *executable, int argc, char **argv) {
     setpgrp(0, 0);
 #endif
 
-    if (cli::kdalloc.getValue()) {
+    if (kconfig.kdalloc) {
       setenv("LD_PRELOAD", cli::libKDAlloc.getValue().c_str(), 1);
+      if (!kconfig.kdalloc_quarantine.empty()) {
+        setenv("KDALLOC_QUARANTINE", kconfig.kdalloc_quarantine.c_str(), 1);
+      }
+      if (!kconfig.kdalloc_heap_start_address.empty()) {
+        setenv("KDALLOC_HEAP_START_ADDRESS",
+               kconfig.kdalloc_heap_start_address.c_str(), 1);
+      }
+      if (!kconfig.kdalloc_heap_size.empty()) {
+        setenv("KDALLOC_HEAP_SIZE", kconfig.kdalloc_heap_size.c_str(), 1);
+      }
     }
 
     if (cli::chrootToDir.getValue().empty()) {
@@ -326,6 +339,12 @@ int main(int argc, char **argv) {
       exit(1);
     }
 
+    KConfig kconfig(
+        cli::kconfig.getValue().empty()
+            ? std::filesystem::path(cli::ktest.getValue()).parent_path() /
+                  "klee.kconfig"
+            : std::filesystem::path(cli::kconfig.getValue()));
+
     obj_index = 0;
     int prg_argc = input->numArgs;
     char **prg_argv = input->args;
@@ -360,7 +379,7 @@ int main(int argc, char **argv) {
       _exit(66);
     } else if (pid == 0) {
       /* Run the executable */
-      run_monitored(executable, prg_argc, prg_argv);
+      run_monitored(executable, prg_argc, prg_argv, kconfig);
       _exit(0);
     } else {
       /* Wait for the executable to finish. */

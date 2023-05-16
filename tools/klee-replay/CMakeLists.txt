@@ -11,6 +11,7 @@ if (HAVE_PTY_H OR HAVE_UTIL_H OR HAVE_LIBUTIL_H)
     cli.cpp
     fd_init.c
     file-creator.cpp
+    kconfig.cpp
     klee-replay.cpp
     klee_init_env.c
   )

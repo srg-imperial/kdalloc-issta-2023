@@ -68,13 +68,14 @@ llvm::cl::opt<bool>
                     llvm::cl::cat(kleeReplayCategory));
 
 llvm::cl::opt<std::string>
-    libKDAlloc("libkdalloc", llvm::cl::desc("location of libKDAlloc.so"),
+    libKDAlloc("libkdalloc", llvm::cl::desc("explicitly specify location of libKDAlloc.so"),
                llvm::cl::init(executablePath().parent_path() / ".." / "lib" /
                               "libKDAlloc.so"),
                llvm::cl::cat(kleeReplayCategory));
 
-llvm::cl::opt<bool> kdalloc("kdalloc", llvm::cl::desc("run with kdalloc"),
-                            llvm::cl::cat(kleeReplayCategory));
+llvm::cl::opt<std::string> kconfig("kconfig",
+                                 llvm::cl::desc("location of klee.kconfig (default: next to given ktest-file)"),
+                                 llvm::cl::cat(kleeReplayCategory));
 
 llvm::cl::opt<std::string> ktest(llvm::cl::Positional, llvm::cl::Required,
                                  llvm::cl::desc("ktest-file"),
