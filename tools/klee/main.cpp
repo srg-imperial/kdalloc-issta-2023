@@ -1606,8 +1606,10 @@ int main(int argc, char **argv, char **envp) {
 
   handler->getInfoStream() << stats.str();
 
-  auto config_file = handler->openOutputFile("klee.kconfig");
-  KConfig::get().manifest(std::move(config_file));
+  {
+    auto config_file = handler->openOutputFile("klee.kconfig");
+    KConfig::get().manifest(*config_file);
+  }
 
   delete handler;
 

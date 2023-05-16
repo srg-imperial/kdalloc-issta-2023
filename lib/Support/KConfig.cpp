@@ -9,15 +9,17 @@
 
 #include "klee/Support/KConfig.h"
 
+#include <utility>
+
 using namespace klee;
 
 void KConfig::register_option(std::string key, std::string value) {
-  configurations.insert({key, value});
+  configurations.insert({std::move(key), std::move(value)});
 }
 
-void KConfig::manifest(std::unique_ptr<llvm::raw_fd_ostream> file) {
+void KConfig::manifest(llvm::raw_ostream &file) {
   for (const auto &[key, value] : configurations) {
-    (*file) << key << ":" << value << "\n";
+    file << key << ":" << value << "\n";
   }
-  (*file).flush();
+  file.flush();
 }

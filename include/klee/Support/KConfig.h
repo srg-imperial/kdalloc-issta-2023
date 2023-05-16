@@ -31,7 +31,7 @@ public:
 
   void register_option(std::string key, std::string value);
 
-  void manifest(std::unique_ptr<llvm::raw_fd_ostream> file);
+  void manifest(llvm::raw_ostream &file);
 
   KConfig(const KConfig &) = delete;
   KConfig &operator=(const KConfig &) = delete;
