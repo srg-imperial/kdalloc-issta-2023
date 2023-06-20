@@ -1,0 +1,779 @@
+diff --git a/compiler-rt/lib/asan/CMakeLists.txt b/compiler-rt/lib/asan/CMakeLists.txt
+index 0e7250a8fa10..e34ad010a933 100644
+--- a/compiler-rt/lib/asan/CMakeLists.txt
++++ b/compiler-rt/lib/asan/CMakeLists.txt
+@@ -1,5 +1,8 @@
+ # Build for the AddressSanitizer runtime support library.
+ 
++set(KLEE_INCLUDE_DIR "" CACHE PATH "path to KLEE's include directory")
++set(KDALLOC_ASAN_LIB_DIR "" CACHE PATH "path to the directory containing 'libKDAllocAsan.a'")
++
+ set(ASAN_SOURCES
+   asan_allocator.cpp
+   asan_activation.cpp
+@@ -84,6 +87,7 @@ SET(ASAN_HEADERS
+   )
+ 
+ include_directories(..)
++include_directories(${KLEE_INCLUDE_DIR})
+ 
+ set(ASAN_CFLAGS ${SANITIZER_COMMON_CFLAGS})
+ set(ASAN_COMMON_DEFINITIONS ${COMPILER_RT_ASAN_SHADOW_SCALE_DEFINITION})
+@@ -98,7 +102,7 @@ endif()
+ # Too many existing bugs, needs cleanup.
+ append_list_if(COMPILER_RT_HAS_WNO_FORMAT -Wno-format ASAN_CFLAGS)
+ 
+-set(ASAN_DYNAMIC_LINK_FLAGS ${SANITIZER_COMMON_LINK_FLAGS})
++set(ASAN_DYNAMIC_LINK_FLAGS ${SANITIZER_COMMON_LINK_FLAGS} "-L${KDALLOC_ASAN_LIB_DIR}")
+ 
+ if(ANDROID)
+ # Put most Sanitizer shared libraries in the global group. For more details, see
+@@ -117,7 +121,7 @@ append_list_if(COMPILER_RT_HAS_FTLS_MODEL_INITIAL_EXEC
+   -ftls-model=initial-exec ASAN_DYNAMIC_CFLAGS)
+ append_list_if(MSVC /DEBUG ASAN_DYNAMIC_LINK_FLAGS)
+ 
+-set(ASAN_DYNAMIC_LIBS ${SANITIZER_CXX_ABI_LIBRARIES} ${SANITIZER_COMMON_LINK_LIBS})
++set(ASAN_DYNAMIC_LIBS ${SANITIZER_CXX_ABI_LIBRARIES} ${SANITIZER_COMMON_LINK_LIBS} "libKDAllocAsan.a")
+ 
+ append_list_if(COMPILER_RT_HAS_LIBDL dl ASAN_DYNAMIC_LIBS)
+ append_list_if(COMPILER_RT_HAS_LIBRT rt ASAN_DYNAMIC_LIBS)
+diff --git a/compiler-rt/lib/asan/asan_allocator.cpp b/compiler-rt/lib/asan/asan_allocator.cpp
+index f9f1cfcd9f87..18c14947b789 100644
+--- a/compiler-rt/lib/asan/asan_allocator.cpp
++++ b/compiler-rt/lib/asan/asan_allocator.cpp
+@@ -25,10 +25,11 @@
+ #include "sanitizer_common/sanitizer_allocator_checks.h"
+ #include "sanitizer_common/sanitizer_allocator_interface.h"
+ #include "sanitizer_common/sanitizer_errno.h"
++#include "sanitizer_common/sanitizer_flag_parser.h"
+ #include "sanitizer_common/sanitizer_flags.h"
+ #include "sanitizer_common/sanitizer_internal_defs.h"
++#include "sanitizer_common/sanitizer_libc.h"
+ #include "sanitizer_common/sanitizer_list.h"
+-#include "sanitizer_common/sanitizer_quarantine.h"
+ #include "sanitizer_common/sanitizer_stackdepot.h"
+ 
+ namespace __asan {
+@@ -67,24 +68,15 @@ static void AtomicContextLoad(const volatile atomic_uint64_t *atomic_context,
+   tid = context;
+ }
+ 
+-// The memory chunk allocated from the underlying allocator looks like this:
++// The memory around an allocated chunk looks like this:
+ // L L L L L L H H U U U U U U R R
+ //   L -- left redzone words (0 or more bytes)
+ //   H -- ChunkHeader (16 bytes), which is also a part of the left redzone.
+-//   U -- user memory.
++//   U -- user memory (allocated from KDAlloc)
+ //   R -- right redzone (0 or more bytes)
+ // ChunkBase consists of ChunkHeader and other bytes that overlap with user
+ // memory.
+ 
+-// If the left redzone is greater than the ChunkHeader size we store a magic
+-// value in the first uptr word of the memory block and store the address of
+-// ChunkBase in the next uptr.
+-// M B L L L L L L L L L  H H U U U U U U
+-//   |                    ^
+-//   ---------------------|
+-//   M -- magic value kAllocBegMagic
+-//   B -- address of ChunkHeader pointing to the first 'H'
+-
+ class ChunkHeader {
+  public:
+   atomic_uint8_t chunk_state;
+@@ -162,85 +154,6 @@ class AsanChunk : public ChunkBase {
+   }
+ };
+ 
+-class LargeChunkHeader {
+-  static constexpr uptr kAllocBegMagic =
+-      FIRST_32_SECOND_64(0xCC6E96B9, 0xCC6E96B9CC6E96B9ULL);
+-  atomic_uintptr_t magic;
+-  AsanChunk *chunk_header;
+-
+- public:
+-  AsanChunk *Get() const {
+-    return atomic_load(&magic, memory_order_acquire) == kAllocBegMagic
+-               ? chunk_header
+-               : nullptr;
+-  }
+-
+-  void Set(AsanChunk *p) {
+-    if (p) {
+-      chunk_header = p;
+-      atomic_store(&magic, kAllocBegMagic, memory_order_release);
+-      return;
+-    }
+-
+-    uptr old = kAllocBegMagic;
+-    if (!atomic_compare_exchange_strong(&magic, &old, 0,
+-                                        memory_order_release)) {
+-      CHECK_EQ(old, kAllocBegMagic);
+-    }
+-  }
+-};
+-
+-struct QuarantineCallback {
+-  QuarantineCallback(AllocatorCache *cache, BufferedStackTrace *stack)
+-      : cache_(cache),
+-        stack_(stack) {
+-  }
+-
+-  void Recycle(AsanChunk *m) {
+-    void *p = get_allocator().GetBlockBegin(m);
+-    if (p != m) {
+-      // Clear the magic value, as allocator internals may overwrite the
+-      // contents of deallocated chunk, confusing GetAsanChunk lookup.
+-      reinterpret_cast<LargeChunkHeader *>(p)->Set(nullptr);
+-    }
+-
+-    u8 old_chunk_state = CHUNK_QUARANTINE;
+-    if (!atomic_compare_exchange_strong(&m->chunk_state, &old_chunk_state,
+-                                        CHUNK_INVALID, memory_order_acquire)) {
+-      CHECK_EQ(old_chunk_state, CHUNK_QUARANTINE);
+-    }
+-
+-    PoisonShadow(m->Beg(), RoundUpTo(m->UsedSize(), ASAN_SHADOW_GRANULARITY),
+-                 kAsanHeapLeftRedzoneMagic);
+-
+-    // Statistics.
+-    AsanStats &thread_stats = GetCurrentThreadStats();
+-    thread_stats.real_frees++;
+-    thread_stats.really_freed += m->UsedSize();
+-
+-    get_allocator().Deallocate(cache_, p);
+-  }
+-
+-  void *Allocate(uptr size) {
+-    void *res = get_allocator().Allocate(cache_, size, 1);
+-    // TODO(alekseys): Consider making quarantine OOM-friendly.
+-    if (UNLIKELY(!res))
+-      ReportOutOfMemory(size, stack_);
+-    return res;
+-  }
+-
+-  void Deallocate(void *p) {
+-    get_allocator().Deallocate(cache_, p);
+-  }
+-
+- private:
+-  AllocatorCache* const cache_;
+-  BufferedStackTrace* const stack_;
+-};
+-
+-typedef Quarantine<QuarantineCallback, AsanChunk> AsanQuarantine;
+-typedef AsanQuarantine::Cache QuarantineCache;
+-
+ void AsanMapUnmapCallback::OnMap(uptr p, uptr size) const {
+   PoisonShadow(p, size, kAsanHeapLeftRedzoneMagic);
+   // Statistics.
+@@ -267,15 +180,7 @@ AllocatorCache *GetAllocatorCache(AsanThreadLocalMallocStorage *ms) {
+   return &ms->allocator_cache;
+ }
+ 
+-QuarantineCache *GetQuarantineCache(AsanThreadLocalMallocStorage *ms) {
+-  CHECK(ms);
+-  CHECK_LE(sizeof(QuarantineCache), sizeof(ms->quarantine_cache));
+-  return reinterpret_cast<QuarantineCache *>(ms->quarantine_cache);
+-}
+-
+ void AllocatorOptions::SetFrom(const Flags *f, const CommonFlags *cf) {
+-  quarantine_size_mb = f->quarantine_size_mb;
+-  thread_local_quarantine_size_kb = f->thread_local_quarantine_size_kb;
+   min_redzone = f->redzone;
+   max_redzone = f->max_redzone;
+   may_return_null = cf->allocator_may_return_null;
+@@ -284,8 +189,6 @@ void AllocatorOptions::SetFrom(const Flags *f, const CommonFlags *cf) {
+ }
+ 
+ void AllocatorOptions::CopyTo(Flags *f, CommonFlags *cf) {
+-  f->quarantine_size_mb = quarantine_size_mb;
+-  f->thread_local_quarantine_size_kb = thread_local_quarantine_size_kb;
+   f->redzone = min_redzone;
+   f->max_redzone = max_redzone;
+   cf->allocator_may_return_null = may_return_null;
+@@ -298,10 +201,8 @@ struct Allocator {
+       FIRST_32_SECOND_64(3UL << 30, 1ULL << 40);
+ 
+   AsanAllocator allocator;
+-  AsanQuarantine quarantine;
+   StaticSpinMutex fallback_mutex;
+   AllocatorCache fallback_allocator_cache;
+-  QuarantineCache fallback_quarantine_cache;
+ 
+   uptr max_user_defined_malloc_size;
+ 
+@@ -311,9 +212,7 @@ struct Allocator {
+   atomic_uint8_t alloc_dealloc_mismatch;
+ 
+   // ------------------- Initialization ------------------------
+-  explicit Allocator(LinkerInitialized)
+-      : quarantine(LINKER_INITIALIZED),
+-        fallback_quarantine_cache(LINKER_INITIALIZED) {}
++  explicit Allocator(LinkerInitialized) {}
+ 
+   void CheckOptions(const AllocatorOptions &options) const {
+     CHECK_GE(options.min_redzone, 16);
+@@ -325,8 +224,6 @@ struct Allocator {
+ 
+   void SharedInitCode(const AllocatorOptions &options) {
+     CheckOptions(options);
+-    quarantine.Init((uptr)options.quarantine_size_mb << 20,
+-                    (uptr)options.thread_local_quarantine_size_kb << 10);
+     atomic_store(&alloc_dealloc_mismatch, options.alloc_dealloc_mismatch,
+                  memory_order_release);
+     atomic_store(&min_redzone, options.min_redzone, memory_order_release);
+@@ -335,7 +232,26 @@ struct Allocator {
+ 
+   void InitLinkerInitialized(const AllocatorOptions &options) {
+     SetAllocatorMayReturnNull(options.may_return_null);
+-    allocator.InitLinkerInitialized(options.release_to_os_interval_ms);
++    uptr address = 0;
++    if (const char *kdalloc_address = GetEnv("KDALLOC_HEAP_START_ADDRESS")) {
++      const char *end;
++      address = internal_simple_strtoll(kdalloc_address, &end, 0);
++      Report("Using KDALLOC_HEAP_START_ADDRESS: 0x%zx\n", address);
++    }
++    uptr size = static_cast<uptr>(1024) << 30;
++    if (const char *kdalloc_size = GetEnv("KDALLOC_HEAP_SIZE")) {
++      const char *end;
++      size = internal_simple_strtoll(kdalloc_size, &end, 0);
++      Report("Using KDALLOC_HEAP_SIZE: 0x%zx\n", size);
++    }
++    int quarantine = 8;
++    if (const char *kdalloc_quarantine = GetEnv("KDALLOC_QUARANTINE")) {
++      FlagHandler<int> *fh =
++          new (FlagParser::Alloc) FlagHandler<int>(&quarantine);
++      fh->Parse(kdalloc_quarantine);
++      Report("Using KDALLOC_QUARANTINE: 0x%zx\n", quarantine);
++    }
++    allocator.InitLinkerInitialized(address, size, quarantine);
+     SharedInitCode(options);
+     max_user_defined_malloc_size = common_flags()->max_allocation_size_mb
+                                        ? common_flags()->max_allocation_size_mb
+@@ -387,8 +303,6 @@ struct Allocator {
+   }
+ 
+   void GetOptions(AllocatorOptions *options) const {
+-    options->quarantine_size_mb = quarantine.GetSize() >> 20;
+-    options->thread_local_quarantine_size_kb = quarantine.GetCacheSize() >> 10;
+     options->min_redzone = atomic_load(&min_redzone, memory_order_acquire);
+     options->max_redzone = atomic_load(&max_redzone, memory_order_acquire);
+     options->may_return_null = AllocatorMayReturnNull();
+@@ -498,14 +412,8 @@ struct Allocator {
+     CHECK(IsPowerOfTwo(alignment));
+     uptr rz_log = ComputeRZLog(size);
+     uptr rz_size = RZLog2Size(rz_log);
+-    uptr rounded_size = RoundUpTo(Max(size, kChunkHeader2Size), alignment);
+-    uptr needed_size = rounded_size + rz_size;
+-    if (alignment > min_alignment)
+-      needed_size += alignment;
+-    // If we are allocating from the secondary allocator, there will be no
+-    // automatic right redzone, so add the right redzone manually.
+-    if (!PrimaryAllocator::CanAllocate(needed_size, alignment))
+-      needed_size += rz_size;
++    uptr rounded_size = RoundUpTo(size, alignment);
++    uptr needed_size = rounded_size;
+     CHECK(IsAligned(needed_size, min_alignment));
+     if (size > kMaxAllowedMallocSize || needed_size > kMaxAllowedMallocSize ||
+         size > max_user_defined_malloc_size) {
+@@ -536,24 +444,53 @@ struct Allocator {
+       ReportOutOfMemory(size, stack);
+     }
+ 
+-    if (*(u8 *)MEM_TO_SHADOW((uptr)allocated) == 0 && CanPoisonMemory()) {
+-      // Heap poisoning is enabled, but the allocator provides an unpoisoned
+-      // chunk. This is possible if CanPoisonMemory() was false for some
+-      // time, for example, due to flags()->start_disabled.
+-      // Anyway, poison the block before using it for anything else.
+-      uptr allocated_size = allocator.GetActuallyAllocatedSize(allocated);
+-      PoisonShadow((uptr)allocated, allocated_size, kAsanHeapLeftRedzoneMagic);
++    // Initially, nothing is poisoned; we will poison at least what ASan would
++    // normally poison, but try to round up and down to full shadow pages.
++    // In KDAlloc, we always aim for at least one (full) page of red zone
++    // between two allocations.
++    uptr first_rz_byte = MEM_TO_SHADOW((uptr)allocated - rz_size);
++    uptr last_rz_byte =
++        MEM_TO_SHADOW((uptr)allocated + needed_size + rz_size - 1);
++    uptr shadow_begin = first_rz_byte;
++    uptr shadow_end = last_rz_byte + 1;
++    if (*(u8 *)first_rz_byte == 0) {
++      // shadow page that contains first_rz_byte was not poisoned before
++      // poison (at least) whole shadow page with first_rz_byte
++      shadow_begin = RoundDownTo(shadow_begin, GetPageSizeCached());
++      shadow_end = shadow_begin + GetPageSizeCached();
++    }
++    if (last_rz_byte > shadow_end && *(u8 *)last_rz_byte == 0) {
++      // last_rz_byte is on different shadow page that was also not poisoned
++      // before
++      shadow_end = RoundUpTo(last_rz_byte, GetPageSizeCached());
+     }
++    CHECK(CanPoisonMemory());
++#define SHADOW_TO_MEM(mem) (((mem) - (ASAN_SHADOW_OFFSET)) << ASAN_SHADOW_SCALE)
++    PoisonShadow(SHADOW_TO_MEM(shadow_begin),
++                 (shadow_end - shadow_begin) << ASAN_SHADOW_SCALE,
++                 kAsanHeapLeftRedzoneMagic);
++#undef SHADOW_TO_MEM
+ 
+     uptr alloc_beg = reinterpret_cast<uptr>(allocated);
+     uptr alloc_end = alloc_beg + needed_size;
+-    uptr user_beg = alloc_beg + rz_size;
+-    if (!IsAligned(user_beg, alignment))
+-      user_beg = RoundUpTo(user_beg, alignment);
++    uptr user_beg = alloc_beg;
++    CHECK(IsAligned(user_beg, alignment));
+     uptr user_end = user_beg + size;
+     CHECK_LE(user_end, alloc_end);
+     uptr chunk_beg = user_beg - kChunkHeaderSize;
+     AsanChunk *m = reinterpret_cast<AsanChunk *>(chunk_beg);
++
++    // detect allocations previously quarantined
++    if (atomic_load(&m->chunk_state, memory_order_relaxed) == CHUNK_QUARANTINE) {
++      PoisonShadow(m->Beg(), RoundUpTo(m->UsedSize(), ASAN_SHADOW_GRANULARITY),
++                  kAsanHeapLeftRedzoneMagic);
++
++      // Statistics.
++      AsanStats &thread_stats = GetCurrentThreadStats();
++      thread_stats.real_frees++;
++      thread_stats.really_freed += m->UsedSize();
++    }
++
+     m->alloc_type = alloc_type;
+     CHECK(size);
+     m->SetUsedSize(size);
+@@ -576,11 +513,13 @@ struct Allocator {
+     AsanStats &thread_stats = GetCurrentThreadStats();
+     thread_stats.mallocs++;
+     thread_stats.malloced += size;
++    /*
+     thread_stats.malloced_redzones += needed_size - size;
+     if (needed_size > SizeClassMap::kMaxSize)
+       thread_stats.malloc_large++;
+     else
+       thread_stats.malloced_by_size[SizeClassMap::ClassID(needed_size)]++;
++    */
+ 
+     void *res = reinterpret_cast<void *>(user_beg);
+     if (can_fill && fl.max_malloc_fill_size) {
+@@ -593,10 +532,6 @@ struct Allocator {
+ #endif
+     // Must be the last mutation of metadata in this function.
+     atomic_store(&m->chunk_state, CHUNK_ALLOCATED, memory_order_release);
+-    if (alloc_beg != chunk_beg) {
+-      CHECK_LE(alloc_beg + sizeof(LargeChunkHeader), chunk_beg);
+-      reinterpret_cast<LargeChunkHeader *>(alloc_beg)->Set(m);
+-    }
+     ASAN_MALLOC_HOOK(res, size);
+     return res;
+   }
+@@ -649,15 +584,12 @@ struct Allocator {
+ 
+     // Push into quarantine.
+     if (t) {
+-      AsanThreadLocalMallocStorage *ms = &t->malloc_storage();
+-      AllocatorCache *ac = GetAllocatorCache(ms);
+-      quarantine.Put(GetQuarantineCache(ms), QuarantineCallback(ac, stack), m,
+-                     m->UsedSize());
++      // quarantine is handled by KDAlloc
++      allocator.Deallocate(nullptr, ptr);
+     } else {
+       SpinMutexLock l(&fallback_mutex);
+-      AllocatorCache *ac = &fallback_allocator_cache;
+-      quarantine.Put(&fallback_quarantine_cache, QuarantineCallback(ac, stack),
+-                     m, m->UsedSize());
++      // quarantine is handled by KDAlloc
++      allocator.Deallocate(nullptr, ptr);
+     }
+   }
+ 
+@@ -750,7 +682,6 @@ struct Allocator {
+ 
+   void CommitBack(AsanThreadLocalMallocStorage *ms, BufferedStackTrace *stack) {
+     AllocatorCache *ac = GetAllocatorCache(ms);
+-    quarantine.Drain(GetQuarantineCache(ms), QuarantineCallback(ac, stack));
+     allocator.SwallowCache(ac);
+   }
+ 
+@@ -763,12 +694,9 @@ struct Allocator {
+   AsanChunk *GetAsanChunk(void *alloc_beg) {
+     if (!alloc_beg)
+       return nullptr;
+-    AsanChunk *p = reinterpret_cast<LargeChunkHeader *>(alloc_beg)->Get();
+-    if (!p) {
+-      if (!allocator.FromPrimary(alloc_beg))
+-        return nullptr;
+-      p = reinterpret_cast<AsanChunk *>(alloc_beg);
+-    }
++    if (!allocator.FromPrimary(alloc_beg))
++      return nullptr;
++    AsanChunk *p = reinterpret_cast<AsanChunk *>((uptr)alloc_beg - kChunkHeaderSize);
+     u8 state = atomic_load(&p->chunk_state, memory_order_relaxed);
+     // It does not guaranty that Chunk is initialized, but it's
+     // definitely not for any other value.
+@@ -818,26 +746,11 @@ struct Allocator {
+   }
+ 
+   void Purge(BufferedStackTrace *stack) {
+-    AsanThread *t = GetCurrentThread();
+-    if (t) {
+-      AsanThreadLocalMallocStorage *ms = &t->malloc_storage();
+-      quarantine.DrainAndRecycle(GetQuarantineCache(ms),
+-                                 QuarantineCallback(GetAllocatorCache(ms),
+-                                                    stack));
+-    }
+-    {
+-      SpinMutexLock l(&fallback_mutex);
+-      quarantine.DrainAndRecycle(&fallback_quarantine_cache,
+-                                 QuarantineCallback(&fallback_allocator_cache,
+-                                                    stack));
+-    }
+-
+     allocator.ForceReleaseToOS();
+   }
+ 
+   void PrintStats() {
+     allocator.PrintStats();
+-    quarantine.PrintStats();
+   }
+ 
+   void ForceLock() SANITIZER_ACQUIRE(fallback_mutex) {
+diff --git a/compiler-rt/lib/asan/asan_allocator.h b/compiler-rt/lib/asan/asan_allocator.h
+index 27d826fb613a..3a6bd11d0b61 100644
+--- a/compiler-rt/lib/asan/asan_allocator.h
++++ b/compiler-rt/lib/asan/asan_allocator.h
+@@ -21,6 +21,8 @@
+ #include "sanitizer_common/sanitizer_list.h"
+ #include "sanitizer_common/sanitizer_platform.h"
+ 
++#include "klee/KDAlloc/asan.h"
++
+ namespace __asan {
+ 
+ enum AllocType {
+@@ -117,81 +119,9 @@ struct AsanMapUnmapCallback {
+   void OnUnmap(uptr p, uptr size) const;
+ };
+ 
+-#if SANITIZER_CAN_USE_ALLOCATOR64
+-# if SANITIZER_FUCHSIA
+-const uptr kAllocatorSpace = ~(uptr)0;
+-const uptr kAllocatorSize  =  0x40000000000ULL;  // 4T.
+-typedef DefaultSizeClassMap SizeClassMap;
+-# elif defined(__powerpc64__)
+-const uptr kAllocatorSpace = ~(uptr)0;
+-const uptr kAllocatorSize  =  0x20000000000ULL;  // 2T.
+-typedef DefaultSizeClassMap SizeClassMap;
+-# elif defined(__aarch64__) && SANITIZER_ANDROID
+-// Android needs to support 39, 42 and 48 bit VMA.
+-const uptr kAllocatorSpace =  ~(uptr)0;
+-const uptr kAllocatorSize  =  0x2000000000ULL;  // 128G.
+-typedef VeryCompactSizeClassMap SizeClassMap;
+-#elif SANITIZER_RISCV64
+-const uptr kAllocatorSpace = ~(uptr)0;
+-const uptr kAllocatorSize = 0x2000000000ULL;  // 128G.
+-typedef VeryDenseSizeClassMap SizeClassMap;
+-# elif defined(__aarch64__)
+-// AArch64/SANITIZER_CAN_USE_ALLOCATOR64 is only for 42-bit VMA
+-// so no need to different values for different VMA.
+-const uptr kAllocatorSpace =  0x10000000000ULL;
+-const uptr kAllocatorSize  =  0x10000000000ULL;  // 3T.
+-typedef DefaultSizeClassMap SizeClassMap;
+-#elif defined(__sparc__)
+-const uptr kAllocatorSpace = ~(uptr)0;
+-const uptr kAllocatorSize = 0x20000000000ULL;  // 2T.
+-typedef DefaultSizeClassMap SizeClassMap;
+-# elif SANITIZER_WINDOWS
+-const uptr kAllocatorSpace = ~(uptr)0;
+-const uptr kAllocatorSize  =  0x8000000000ULL;  // 500G
+-typedef DefaultSizeClassMap SizeClassMap;
+-# else
+-const uptr kAllocatorSpace = 0x600000000000ULL;
+-const uptr kAllocatorSize  =  0x40000000000ULL;  // 4T.
+-typedef DefaultSizeClassMap SizeClassMap;
+-# endif
+-template <typename AddressSpaceViewTy>
+-struct AP64 {  // Allocator64 parameters. Deliberately using a short name.
+-  static const uptr kSpaceBeg = kAllocatorSpace;
+-  static const uptr kSpaceSize = kAllocatorSize;
+-  static const uptr kMetadataSize = 0;
+-  typedef __asan::SizeClassMap SizeClassMap;
+-  typedef AsanMapUnmapCallback MapUnmapCallback;
+-  static const uptr kFlags = 0;
+-  using AddressSpaceView = AddressSpaceViewTy;
+-};
+-
+-template <typename AddressSpaceView>
+-using PrimaryAllocatorASVT = SizeClassAllocator64<AP64<AddressSpaceView>>;
+-using PrimaryAllocator = PrimaryAllocatorASVT<LocalAddressSpaceView>;
+-#else  // Fallback to SizeClassAllocator32.
+-typedef CompactSizeClassMap SizeClassMap;
+-template <typename AddressSpaceViewTy>
+-struct AP32 {
+-  static const uptr kSpaceBeg = 0;
+-  static const u64 kSpaceSize = SANITIZER_MMAP_RANGE_SIZE;
+-  static const uptr kMetadataSize = 0;
+-  typedef __asan::SizeClassMap SizeClassMap;
+-  static const uptr kRegionSizeLog = 20;
+-  using AddressSpaceView = AddressSpaceViewTy;
+-  typedef AsanMapUnmapCallback MapUnmapCallback;
+-  static const uptr kFlags = 0;
+-};
+-template <typename AddressSpaceView>
+-using PrimaryAllocatorASVT = SizeClassAllocator32<AP32<AddressSpaceView> >;
+-using PrimaryAllocator = PrimaryAllocatorASVT<LocalAddressSpaceView>;
+-#endif  // SANITIZER_CAN_USE_ALLOCATOR64
+-
+-static const uptr kNumberOfSizeClasses = SizeClassMap::kNumClasses;
++static const uptr kNumberOfSizeClasses = 9;
+ 
+-template <typename AddressSpaceView>
+-using AsanAllocatorASVT =
+-    CombinedAllocator<PrimaryAllocatorASVT<AddressSpaceView>>;
+-using AsanAllocator = AsanAllocatorASVT<LocalAddressSpaceView>;
++using AsanAllocator = klee::KDAllocAsan;
+ using AllocatorCache = AsanAllocator::AllocatorCache;
+ 
+ struct AsanThreadLocalMallocStorage {
+diff --git a/compiler-rt/lib/asan/asan_interceptors.cpp b/compiler-rt/lib/asan/asan_interceptors.cpp
+index 2ff314a5a9cb..5e324a55f53a 100644
+--- a/compiler-rt/lib/asan/asan_interceptors.cpp
++++ b/compiler-rt/lib/asan/asan_interceptors.cpp
+@@ -43,6 +43,8 @@
+ #    define ASAN_PTHREAD_CREATE_VERSION "GLIBC_2.2"
+ #  endif
+ 
++#include "klee/KDAlloc/asan.h"
++
+ namespace __asan {
+ 
+ #define ASAN_READ_STRING_OF_LEN(ctx, s, len, n)                 \
+@@ -101,7 +103,7 @@ DECLARE_REAL_AND_INTERCEPTOR(void, free, void *)
+ #define COMMON_INTERCEPTOR_ENTER(ctx, func, ...)                               \
+   ASAN_INTERCEPTOR_ENTER(ctx, func);                                           \
+   do {                                                                         \
+-    if (asan_init_is_running)                                                  \
++    if (klee::KDAllocAsan::inKDAllocAsan || asan_init_is_running)              \
+       return REAL(func)(__VA_ARGS__);                                          \
+     if (SANITIZER_MAC && UNLIKELY(!asan_inited))                               \
+       return REAL(func)(__VA_ARGS__);                                          \
+@@ -152,18 +154,24 @@ DECLARE_REAL_AND_INTERCEPTOR(void, free, void *)
+ #define COMMON_INTERCEPTOR_MEMMOVE_IMPL(ctx, to, from, size) \
+   do {                                                       \
+     ASAN_INTERCEPTOR_ENTER(ctx, memmove);                    \
++    if (klee::KDAllocAsan::inKDAllocAsan)                    \
++      return internal_memmove(to, from, size);               \
+     ASAN_MEMMOVE_IMPL(ctx, to, from, size);                  \
+   } while (false)
+ 
+ #define COMMON_INTERCEPTOR_MEMCPY_IMPL(ctx, to, from, size) \
+   do {                                                      \
+     ASAN_INTERCEPTOR_ENTER(ctx, memcpy);                    \
++    if (klee::KDAllocAsan::inKDAllocAsan)                   \
++      return internal_memcpy(to, from, size);               \
+     ASAN_MEMCPY_IMPL(ctx, to, from, size);                  \
+   } while (false)
+ 
+ #define COMMON_INTERCEPTOR_MEMSET_IMPL(ctx, block, c, size) \
+   do {                                                      \
+     ASAN_INTERCEPTOR_ENTER(ctx, memset);                    \
++    if (klee::KDAllocAsan::inKDAllocAsan)                   \
++      return internal_memset(block, c, size);               \
+     ASAN_MEMSET_IMPL(ctx, block, c, size);                  \
+   } while (false)
+ 
+diff --git a/compiler-rt/lib/asan/asan_malloc_linux.cpp b/compiler-rt/lib/asan/asan_malloc_linux.cpp
+index bab80b96f584..8f1c9b3a48bc 100644
+--- a/compiler-rt/lib/asan/asan_malloc_linux.cpp
++++ b/compiler-rt/lib/asan/asan_malloc_linux.cpp
+@@ -13,6 +13,7 @@
+ // They will replace the corresponding libc functions automagically.
+ //===----------------------------------------------------------------------===//
+ 
++#include "sanitizer_common/sanitizer_allocator_internal.h"
+ #include "sanitizer_common/sanitizer_platform.h"
+ #if SANITIZER_FREEBSD || SANITIZER_FUCHSIA || SANITIZER_LINUX || \
+     SANITIZER_NETBSD || SANITIZER_SOLARIS
+@@ -27,6 +28,8 @@
+ #  include "sanitizer_common/sanitizer_errno.h"
+ #  include "sanitizer_common/sanitizer_tls_get_addr.h"
+ 
++#include "klee/KDAlloc/asan.h"
++
+ // ---------------------- Replacement functions ---------------- {{{1
+ using namespace __asan;
+ 
+@@ -47,6 +50,8 @@ struct DlsymAlloc : public DlSymAllocator<DlsymAlloc> {
+ };
+ 
+ INTERCEPTOR(void, free, void *ptr) {
++  if (klee::KDAllocAsan::inKDAllocAsan)
++    return InternalFree(ptr);
+   if (DlsymAlloc::PointerIsMine(ptr))
+     return DlsymAlloc::Free(ptr);
+   GET_STACK_TRACE_FREE;
+@@ -63,6 +68,8 @@ INTERCEPTOR(void, cfree, void *ptr) {
+ #endif // SANITIZER_INTERCEPT_CFREE
+ 
+ INTERCEPTOR(void*, malloc, uptr size) {
++  if (klee::KDAllocAsan::inKDAllocAsan)
++    return InternalAlloc(size);
+   if (DlsymAlloc::Use())
+     return DlsymAlloc::Allocate(size);
+   ENSURE_ASAN_INITED();
+@@ -71,6 +78,8 @@ INTERCEPTOR(void*, malloc, uptr size) {
+ }
+ 
+ INTERCEPTOR(void*, calloc, uptr nmemb, uptr size) {
++  if (klee::KDAllocAsan::inKDAllocAsan)
++    return InternalCalloc(nmemb, size);
+   if (DlsymAlloc::Use())
+     return DlsymAlloc::Callocate(nmemb, size);
+   ENSURE_ASAN_INITED();
+@@ -79,6 +88,8 @@ INTERCEPTOR(void*, calloc, uptr nmemb, uptr size) {
+ }
+ 
+ INTERCEPTOR(void*, realloc, void *ptr, uptr size) {
++  if (klee::KDAllocAsan::inKDAllocAsan)
++    return InternalRealloc(ptr, size);
+   if (DlsymAlloc::Use() || DlsymAlloc::PointerIsMine(ptr))
+     return DlsymAlloc::Realloc(ptr, size);
+   ENSURE_ASAN_INITED();
+@@ -88,6 +99,8 @@ INTERCEPTOR(void*, realloc, void *ptr, uptr size) {
+ 
+ #if SANITIZER_INTERCEPT_REALLOCARRAY
+ INTERCEPTOR(void*, reallocarray, void *ptr, uptr nmemb, uptr size) {
++  if (klee::KDAllocAsan::inKDAllocAsan)
++    return InternalReallocArray(ptr, nmemb, size);
+   ENSURE_ASAN_INITED();
+   GET_STACK_TRACE_MALLOC;
+   return asan_reallocarray(ptr, nmemb, size, &stack);
+@@ -96,11 +109,15 @@ INTERCEPTOR(void*, reallocarray, void *ptr, uptr nmemb, uptr size) {
+ 
+ #if SANITIZER_INTERCEPT_MEMALIGN
+ INTERCEPTOR(void*, memalign, uptr boundary, uptr size) {
++  if (klee::KDAllocAsan::inKDAllocAsan)
++    return InternalAlloc(size, nullptr, boundary);
+   GET_STACK_TRACE_MALLOC;
+   return asan_memalign(boundary, size, &stack, FROM_MALLOC);
+ }
+ 
+ INTERCEPTOR(void*, __libc_memalign, uptr boundary, uptr size) {
++  if (klee::KDAllocAsan::inKDAllocAsan)
++    return InternalAlloc(size, nullptr, boundary);
+   GET_STACK_TRACE_MALLOC;
+   void *res = asan_memalign(boundary, size, &stack, FROM_MALLOC);
+   DTLS_on_libc_memalign(res, size);
+diff --git a/compiler-rt/lib/asan/asan_new_delete.cpp b/compiler-rt/lib/asan/asan_new_delete.cpp
+index da446072de18..666aee2a4847 100644
+--- a/compiler-rt/lib/asan/asan_new_delete.cpp
++++ b/compiler-rt/lib/asan/asan_new_delete.cpp
+@@ -18,6 +18,7 @@
+ #include "asan_report.h"
+ #include "asan_stack.h"
+ #include "interception/interception.h"
++#include "sanitizer_common/sanitizer_allocator_internal.h"
+ 
+ // C++ operators can't have dllexport attributes on Windows. We export them
+ // anyway by passing extra -export flags to the linker, which is exactly that
+@@ -71,12 +72,16 @@ enum class align_val_t: size_t {};
+ // allocator behavior.
+ #define OPERATOR_NEW_BODY(type, nothrow)            \
+   GET_STACK_TRACE_MALLOC;                           \
++  if (klee::KDAllocAsan::inKDAllocAsan)             \
++    return InternalAlloc(size, nullptr, 0);         \
+   void *res = asan_memalign(0, size, &stack, type); \
+   if (!nothrow && UNLIKELY(!res))                   \
+     ReportOutOfMemory(size, &stack);                \
+   return res;
+ #define OPERATOR_NEW_BODY_ALIGN(type, nothrow)                \
+   GET_STACK_TRACE_MALLOC;                                     \
++  if (klee::KDAllocAsan::inKDAllocAsan)                       \
++    return InternalAlloc(size, nullptr, (uptr)align);         \
+   void *res = asan_memalign((uptr)align, size, &stack, type); \
+   if (!nothrow && UNLIKELY(!res))                             \
+     ReportOutOfMemory(size, &stack);                          \
+@@ -130,20 +135,28 @@ INTERCEPTOR(void *, _ZnamRKSt9nothrow_t, size_t size, std::nothrow_t const&) {
+ }
+ #endif  // !SANITIZER_MAC
+ 
+-#define OPERATOR_DELETE_BODY(type) \
+-  GET_STACK_TRACE_FREE;            \
++#define OPERATOR_DELETE_BODY(type)      \
++  GET_STACK_TRACE_FREE;                 \
++  if (klee::KDAllocAsan::inKDAllocAsan) \
++    return InternalFree(ptr);           \
+   asan_delete(ptr, 0, 0, &stack, type);
+ 
+ #define OPERATOR_DELETE_BODY_SIZE(type) \
+   GET_STACK_TRACE_FREE;                 \
++  if (klee::KDAllocAsan::inKDAllocAsan) \
++    return InternalFree(ptr);           \
+   asan_delete(ptr, size, 0, &stack, type);
+ 
+ #define OPERATOR_DELETE_BODY_ALIGN(type) \
+   GET_STACK_TRACE_FREE;                  \
++  if (klee::KDAllocAsan::inKDAllocAsan)  \
++    return InternalFree(ptr);            \
+   asan_delete(ptr, 0, static_cast<uptr>(align), &stack, type);
+ 
+ #define OPERATOR_DELETE_BODY_SIZE_ALIGN(type) \
+   GET_STACK_TRACE_FREE;                       \
++  if (klee::KDAllocAsan::inKDAllocAsan)       \
++    return InternalFree(ptr);                 \
+   asan_delete(ptr, size, static_cast<uptr>(align), &stack, type);
+ 
+ #if !SANITIZER_MAC
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_libc.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_libc.cpp
+index d3076f0da489..7288b94041b8 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_libc.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_libc.cpp
+@@ -228,7 +228,7 @@ char *internal_strstr(const char *haystack, const char *needle) {
+ }
+ 
+ s64 internal_simple_strtoll(const char *nptr, const char **endptr, int base) {
+-  CHECK_EQ(base, 10);
++  CHECK(base == 0 || base == 10 || base == 16);
+   while (IsSpace(*nptr)) nptr++;
+   int sgn = 1;
+   u64 res = 0;
+@@ -241,9 +241,25 @@ s64 internal_simple_strtoll(const char *nptr, const char **endptr, int base) {
+     sgn = -1;
+     nptr++;
+   }
+-  while (IsDigit(*nptr)) {
+-    res = (res <= UINT64_MAX / 10) ? res * 10 : UINT64_MAX;
++  if (base == 0 || base == 16) {
++    if (*nptr == '0') {
++      nptr++;
++      if (*nptr == 'x' || *nptr == 'X') {
++        nptr++;
++        base = 16;
++      } else if (base == 0) {
++        base = 8;
++      }
++    } else if (base == 0) {
++      base = 10;
++    }
++  }
++  while (IsDigit(*nptr) || (ToLower(*nptr) >= 'a' && ToLower(*nptr) <= 'z')) {
++    res = (res <= UINT64_MAX / base) ? res * base : UINT64_MAX;
+     int digit = ((*nptr) - '0');
++    if (digit < 0 || digit > 9) {
++      digit = (ToLower(*nptr) - 'a') + 10;
++    }
+     res = (res <= UINT64_MAX - digit) ? res + digit : UINT64_MAX;
+     have_digits = true;
+     nptr++;
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_libc.h b/compiler-rt/lib/sanitizer_common/sanitizer_libc.h
+index 39a212665d0a..3ee42d8881b8 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_libc.h
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_libc.h
+@@ -47,7 +47,7 @@ char *internal_strncpy(char *dst, const char *src, uptr n);
+ uptr internal_strnlen(const char *s, uptr maxlen);
+ char *internal_strrchr(const char *s, int c);
+ char *internal_strstr(const char *haystack, const char *needle);
+-// Works only for base=10 and doesn't set errno.
++// Works only for base=0,10,16 and doesn't set errno.
+ s64 internal_simple_strtoll(const char *nptr, const char **endptr, int base);
+ int internal_snprintf(char *buffer, uptr length, const char *format, ...)
+     FORMAT(3, 4);
