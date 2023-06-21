@@ -108,6 +108,8 @@ public:
     }
   };
 
+  using ObjectIterator = SizedRegions::HoleIterator;
+
 private:
   Data *data = nullptr;
 
@@ -314,6 +316,10 @@ public:
       data->regions.mergeAroundAddress(static_cast<char *>(ptr));
     }
   }
+
+  ObjectIterator objects_begin() const { return data->regions.holes_begin(); }
+
+  ObjectIterator objects_end() const { return data->regions.holes_end(); }
 
   void traceContents(Control const &) const noexcept {
     if (data->regions.isEmpty()) {

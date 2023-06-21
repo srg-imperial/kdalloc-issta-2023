@@ -25,8 +25,7 @@
 
 namespace klee::kdalloc::suballocators {
 namespace slotallocator {
-template<bool UnlimitedQuarantine>
-class SlotAllocator;
+template <bool UnlimitedQuarantine> struct SlotAllocator;
 
 struct Data final {
   /// The reference count.
@@ -51,8 +50,7 @@ struct Data final {
 };
 
 class Control final : public TaggedLogger<Control> {
-  template<bool UnlimitedQuarantine>
-  friend class SlotAllocator;
+  template <bool UnlimitedQuarantine> friend class SlotAllocator;
 
   /// pointer to the start of the range managed by this allocator
   char *baseAddress = nullptr;
@@ -161,13 +159,57 @@ public:
   }
 };
 
-template<>
-class SlotAllocator<false> final : public TaggedLogger<SlotAllocator<false>> {
+template <>
+struct SlotAllocator<false> final : public TaggedLogger<SlotAllocator<false>> {
   static_assert(static_cast<std::size_t>(-1) == ~static_cast<std::size_t>(0),
                 "-1 must be ~0 for size_t");
 
   static_assert(std::is_pod<Data>::value, "Data must be POD");
 
+  class ObjectIterator {
+    friend class SlotAllocator<false>;
+
+    std::size_t cur;
+
+    void skip_free(SlotAllocator<false> const &allocator,
+                   Control const &control) {
+      // we could optimize this a bit more for long runs of freed objects
+      while (cur <
+                 static_cast<std::size_t>(allocator.getLastUsed(control) + 1) *
+                     std::numeric_limits<std::size_t>::digits &&
+             !allocator.isUsed(control, cur)) {
+        ++cur;
+      }
+    }
+
+    ObjectIterator(SlotAllocator<false> const &allocator,
+                   Control const &control, std::size_t cur) noexcept
+        : cur(cur) {
+      skip_free(allocator, control);
+    }
+
+  public:
+    void *get(Control const &control) const {
+      return control.baseAddress + control.convertIndexToPosition(cur);
+    }
+
+    void next(SlotAllocator<false> const &allocator, Control const &control) {
+      ++cur;
+      skip_free(allocator, control);
+    }
+
+    friend bool operator!=(ObjectIterator const &lhs,
+                           ObjectIterator const &rhs) noexcept {
+      return lhs.cur != rhs.cur;
+    }
+
+    friend bool operator==(ObjectIterator const &lhs,
+                           ObjectIterator const &rhs) noexcept {
+      return lhs.cur == rhs.cur;
+    }
+  };
+
+private:
   Data *data = nullptr;
 
   inline void releaseData() noexcept {
@@ -509,6 +551,16 @@ public:
     }
   }
 
+  ObjectIterator objects_begin(Control const &control) const noexcept {
+    return {*this, control, 0};
+  }
+
+  ObjectIterator objects_end(Control const &control) const noexcept {
+    return {*this, control,
+            static_cast<std::size_t>(getLastUsed(control) + 1) *
+                std::numeric_limits<std::size_t>::digits};
+  }
+
   void traceContents(Control const &control) const noexcept {
     static_cast<void>(control);
 
@@ -533,9 +585,34 @@ public:
   }
 };
 
+template <>
+struct SlotAllocator<true> final : public TaggedLogger<SlotAllocator<true>> {
+  class ObjectIterator {
+    friend class SlotAllocator<true>;
 
-template<>
-class SlotAllocator<true> final : public TaggedLogger<SlotAllocator<true>> {
+    std::size_t cur;
+
+    constexpr ObjectIterator(std::size_t cur) noexcept : cur(cur) {}
+
+  public:
+    void *get(Control const &control) const {
+      return control.baseAddress + control.convertIndexToPosition(cur);
+    }
+
+    void next() { ++cur; }
+
+    friend bool operator!=(ObjectIterator const &lhs,
+                           ObjectIterator const &rhs) noexcept {
+      return lhs.cur != rhs.cur;
+    }
+
+    friend bool operator==(ObjectIterator const &lhs,
+                           ObjectIterator const &rhs) noexcept {
+      return lhs.cur == rhs.cur;
+    }
+  };
+
+private:
   std::size_t next;
 
 public:
@@ -577,6 +654,10 @@ public:
   void deallocate(Control const &control, void *const ptr) {
     traceLine("Quarantining ", ptr, " for ever");
   }
+
+  constexpr ObjectIterator objects_begin() const noexcept { return {0}; }
+
+  constexpr ObjectIterator objects_end() const noexcept { return {next}; }
 
   void traceContents(Control const &) const noexcept {
     traceLine("next: ", next);

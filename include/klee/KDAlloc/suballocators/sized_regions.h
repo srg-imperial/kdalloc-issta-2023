@@ -19,6 +19,7 @@
 #include <limits>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace klee::kdalloc::suballocators {
 class SizedRegions;
@@ -64,7 +65,46 @@ public:
       : baseAddress(baseAddress), size(size) {}
 };
 
-class SizedRegions {
+struct SizedRegions {
+  /// @brief Iterates over the *holes between* the regions
+  class HoleIterator {
+    friend class SizedRegions;
+
+    std::vector<Node const *> stack;
+
+    HoleIterator(std::vector<Node const *> &&stack) : stack(std::move(stack)) {}
+
+  public:
+    char *operator*() const {
+      return stack.back()->getBaseAddress() + stack.back()->getSize();
+    }
+
+    HoleIterator &operator++() {
+      auto node = stack.back()->rhs.get();
+      stack.pop_back();
+      for (; node; node = node->lhs.get()) {
+        stack.push_back(node);
+      }
+
+      return *this;
+    }
+
+    HoleIterator operator++(int) {
+      auto copy = *this;
+      ++*this;
+      return copy;
+    }
+
+    friend bool operator==(HoleIterator const &lhs, HoleIterator const &rhs) {
+      return lhs.stack == rhs.stack;
+    }
+
+    friend bool operator!=(HoleIterator const &lhs, HoleIterator const &rhs) {
+      return lhs.stack != rhs.stack;
+    }
+  };
+
+private:
   CoWPtr<Node> root;
 
   static void insertRec(CoWPtr<Node> &treap, CoWPtr<Node> &&region) {
@@ -477,6 +517,29 @@ private:
   }
 
 public:
+  HoleIterator holes_begin() const {
+    std::vector<Node const *> stack;
+    for (Node const *node = root.get(); node; node = node->lhs.get()) {
+      stack.push_back(node);
+    }
+
+    return {std::move(stack)};
+  }
+
+  HoleIterator holes_end() const {
+    std::vector<Node const *> stack;
+
+    if (root) {
+      Node const *node = root.get();
+      while (node->rhs) {
+        node = node->rhs.get();
+      }
+      stack.push_back(node);
+    }
+
+    return {std::move(stack)};
+  }
+
   template <typename OutStream> OutStream &dump(OutStream &out) {
     std::string prefix;
     dumpRec(out, prefix, root);

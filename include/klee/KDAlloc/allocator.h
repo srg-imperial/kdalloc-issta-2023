@@ -24,6 +24,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <ostream>
 #include <type_traits>
@@ -33,9 +34,12 @@ namespace klee::kdalloc {
 /// allocators (size < 4096) or a large object allocator (size >= 4096).
 class Allocator final : public TaggedLogger<Allocator> {
 public:
+  class ObjectIterator;
+
   class Control final {
     friend class Allocator;
     friend class AllocatorFactory;
+    friend class ObjectIterator;
 
     static constexpr const std::uint32_t unlimitedQuarantine =
         static_cast<std::uint32_t>(-1);
@@ -93,6 +97,298 @@ public:
     Control(Mapping &&mapping) : mapping(std::move(mapping)) {}
   };
 
+  struct ObjectIterator {
+    friend class Allocator;
+
+    using difference_type = std::ptrdiff_t;
+    using value_type = void *;
+    using pointer = value_type;
+    using reference = value_type;
+    using iterator_category = std::input_iterator_tag;
+
+  public:
+    Allocator const *allocator{};
+    std::size_t bin;
+    std::aligned_union_t<0, suballocators::SlotAllocator<false>::ObjectIterator,
+                         suballocators::SlotAllocator<false>::ObjectIterator,
+                         suballocators::LargeObjectAllocator::ObjectIterator>
+        base_iterator;
+
+    /// Generates an iterator to the element of the named bin. Use
+    /// `Control::meta.size()` as the bin argument to create an `end` iterator.
+    ObjectIterator(Allocator const *allocator, std::size_t bin) noexcept
+        : allocator(allocator), bin(bin) {
+      create_iterator();
+      advance_bins();
+    }
+
+    void create_iterator() {
+      if (bin < Control::meta.size() + 1) {
+        if (bin < Control::meta.size()) {
+          if (allocator->control->sizedBins[bin].isQuarantineUnlimited()) {
+            using A = suballocators::SlotAllocator<true>;
+            new (&base_iterator) A::ObjectIterator{
+                reinterpret_cast<A const &>(allocator->sizedBins[bin])
+                    .objects_begin()};
+          } else {
+            using A = suballocators::SlotAllocator<false>;
+            new (&base_iterator) A::ObjectIterator{
+                reinterpret_cast<A const &>(allocator->sizedBins[bin])
+                    .objects_begin(allocator->control->sizedBins[bin])};
+          }
+        } else {
+          new (&base_iterator)
+              suballocators::LargeObjectAllocator::ObjectIterator{
+                  allocator->largeObjectBin.objects_begin()};
+        }
+      }
+    }
+
+    void destroy_iterator() {
+      // explicitly calling destructors on qualified type aliases is a bit
+      // painful, so we just create unqualified aliases for everything
+      if (bin < Control::meta.size() + 1) {
+        if (bin < Control::meta.size()) {
+          if (allocator->control->sizedBins[bin].isQuarantineUnlimited()) {
+            using I = suballocators::SlotAllocator<true>::ObjectIterator;
+            reinterpret_cast<I &>(base_iterator).~I();
+          } else {
+            using I = suballocators::SlotAllocator<false>::ObjectIterator;
+            reinterpret_cast<I &>(base_iterator).~I();
+          }
+        } else {
+          using I = suballocators::LargeObjectAllocator::ObjectIterator;
+          reinterpret_cast<I &>(base_iterator).~I();
+        }
+      }
+    }
+
+    void advance_bins() {
+      while (bin < Control::meta.size() + 1) {
+        if (bin < Control::meta.size()) {
+          if (allocator->control->sizedBins[bin].isQuarantineUnlimited()) {
+            using A = suballocators::SlotAllocator<true>;
+            using I = A::ObjectIterator;
+            if (reinterpret_cast<I const &>(base_iterator) !=
+                reinterpret_cast<A const &>(allocator->sizedBins[bin])
+                    .objects_end()) {
+              break;
+            } else {
+              reinterpret_cast<I &>(base_iterator).~I();
+              ++bin;
+              create_iterator();
+            }
+          } else {
+            using A = suballocators::SlotAllocator<false>;
+            using I = A::ObjectIterator;
+            if (reinterpret_cast<I const &>(base_iterator) !=
+                reinterpret_cast<A const &>(allocator->sizedBins[bin])
+                    .objects_end(allocator->control->sizedBins[bin])) {
+              break;
+            } else {
+              reinterpret_cast<I &>(base_iterator).~I();
+              ++bin;
+              create_iterator();
+            }
+          }
+        } else {
+          using I = suballocators::LargeObjectAllocator::ObjectIterator;
+          if (reinterpret_cast<I const &>(base_iterator) !=
+              allocator->largeObjectBin.objects_end()) {
+            break;
+          } else {
+            reinterpret_cast<I &>(base_iterator).~I();
+            ++bin;
+            create_iterator();
+          }
+        }
+      }
+    }
+
+  public:
+    ObjectIterator(ObjectIterator const &rhs)
+        : allocator(rhs.allocator), bin(rhs.bin) {
+      if (bin < Control::meta.size() + 1) {
+        if (bin < Control::meta.size()) {
+          if (allocator->control->sizedBins[bin].isQuarantineUnlimited()) {
+            using I = suballocators::SlotAllocator<true>::ObjectIterator;
+            new (&base_iterator)
+                I{reinterpret_cast<I const &>(rhs.base_iterator)};
+          } else {
+            using I = suballocators::SlotAllocator<false>::ObjectIterator;
+            new (&base_iterator)
+                I{reinterpret_cast<I const &>(rhs.base_iterator)};
+          }
+        } else {
+          using I = suballocators::LargeObjectAllocator::ObjectIterator;
+          new (&base_iterator)
+              I{reinterpret_cast<I const &>(rhs.base_iterator)};
+        }
+      }
+    }
+
+    ObjectIterator &operator=(ObjectIterator const &rhs) {
+      if (this != &rhs) {
+        destroy_iterator();
+        allocator = rhs.allocator;
+        bin = rhs.bin;
+
+        if (bin < Control::meta.size() + 1) {
+          if (bin < Control::meta.size()) {
+            if (allocator->control->sizedBins[bin].isQuarantineUnlimited()) {
+              using I = suballocators::SlotAllocator<true>::ObjectIterator;
+              new (&base_iterator)
+                  I{reinterpret_cast<I const &>(rhs.base_iterator)};
+            } else {
+              using I = suballocators::SlotAllocator<false>::ObjectIterator;
+              new (&base_iterator)
+                  I{reinterpret_cast<I const &>(rhs.base_iterator)};
+            }
+          } else {
+            using I = suballocators::LargeObjectAllocator::ObjectIterator;
+            new (&base_iterator)
+                I{reinterpret_cast<I const &>(rhs.base_iterator)};
+          }
+        }
+      }
+      return *this;
+    }
+
+    ObjectIterator(ObjectIterator &&rhs)
+        : allocator(std::move(rhs.allocator)), bin(std::move(rhs.bin)) {
+      if (bin < Control::meta.size() + 1) {
+        if (bin < Control::meta.size()) {
+          if (allocator->control->sizedBins[bin].isQuarantineUnlimited()) {
+            using I = suballocators::SlotAllocator<true>::ObjectIterator;
+            new (&base_iterator) I{reinterpret_cast<I &&>(rhs.base_iterator)};
+          } else {
+            using I = suballocators::SlotAllocator<false>::ObjectIterator;
+            new (&base_iterator) I{reinterpret_cast<I &&>(rhs.base_iterator)};
+          }
+        } else {
+          using I = suballocators::LargeObjectAllocator::ObjectIterator;
+          new (&base_iterator) I{reinterpret_cast<I &&>(rhs.base_iterator)};
+        }
+        rhs.destroy_iterator();
+        rhs.bin = Control::meta.size() + 1;
+      }
+    }
+
+    ObjectIterator &operator=(ObjectIterator &&rhs) {
+      if (this != &rhs) {
+        destroy_iterator();
+        allocator = rhs.allocator;
+        bin = rhs.bin;
+
+        if (bin < Control::meta.size() + 1) {
+          if (bin < Control::meta.size()) {
+            if (allocator->control->sizedBins[bin].isQuarantineUnlimited()) {
+              using I = suballocators::SlotAllocator<true>::ObjectIterator;
+              new (&base_iterator) I{reinterpret_cast<I &&>(rhs.base_iterator)};
+            } else {
+              using I = suballocators::SlotAllocator<false>::ObjectIterator;
+              new (&base_iterator) I{reinterpret_cast<I &&>(rhs.base_iterator)};
+            }
+          } else {
+            using I = suballocators::LargeObjectAllocator::ObjectIterator;
+            new (&base_iterator) I{reinterpret_cast<I &&>(rhs.base_iterator)};
+          }
+          rhs.destroy_iterator();
+          rhs.bin = Control::meta.size() + 1;
+        }
+      }
+      return *this;
+    }
+
+    ~ObjectIterator() { destroy_iterator(); }
+
+    ObjectIterator &operator++() {
+      if (bin < Control::meta.size() + 1) {
+        if (bin < Control::meta.size()) {
+          if (allocator->control->sizedBins[bin].isQuarantineUnlimited()) {
+            reinterpret_cast<
+                suballocators::SlotAllocator<true>::ObjectIterator &>(
+                base_iterator)
+                .next();
+          } else {
+            using A = suballocators::SlotAllocator<false>;
+            reinterpret_cast<A::ObjectIterator &>(base_iterator)
+                .next(reinterpret_cast<A const &>(allocator->sizedBins[bin]),
+                      allocator->control->sizedBins[bin]);
+          }
+        } else {
+          ++reinterpret_cast<
+              suballocators::LargeObjectAllocator::ObjectIterator &>(
+              base_iterator);
+        }
+
+        advance_bins();
+      }
+
+      return *this;
+    }
+
+    ObjectIterator operator++(int) {
+      auto copy = *this;
+      ++*this;
+      return copy;
+    }
+
+    void *operator*() const {
+      assert(bin < Control::meta.size() + 1 &&
+             "Must not dereference end iterator");
+
+      if (bin < Control::meta.size()) {
+        if (allocator->control->sizedBins[bin].isQuarantineUnlimited()) {
+          return reinterpret_cast<suballocators::SlotAllocator<
+              true>::ObjectIterator const &>(base_iterator)
+              .get(allocator->control->sizedBins[bin]);
+        } else {
+          using A = suballocators::SlotAllocator<false>;
+          return reinterpret_cast<A::ObjectIterator const &>(base_iterator)
+              .get(allocator->control->sizedBins[bin]);
+        }
+      } else {
+        return *reinterpret_cast<
+            suballocators::LargeObjectAllocator::ObjectIterator const &>(
+            base_iterator);
+      }
+    }
+
+    bool operator==(ObjectIterator const &other) const {
+      assert(allocator == other.allocator &&
+             "Cannot compare iterators from different allocators");
+
+      if (bin != other.bin) {
+        return false;
+      }
+
+      if (bin < Control::meta.size() + 1) {
+        if (bin < Control::meta.size()) {
+          if (allocator->control->sizedBins[bin].isQuarantineUnlimited()) {
+            using I = suballocators::SlotAllocator<true>::ObjectIterator;
+            return reinterpret_cast<I const &>(base_iterator) ==
+                   reinterpret_cast<I const &>(other.base_iterator);
+          } else {
+            using I = suballocators::SlotAllocator<false>::ObjectIterator;
+            return reinterpret_cast<I const &>(base_iterator) ==
+                   reinterpret_cast<I const &>(other.base_iterator);
+          }
+        } else {
+          using I = suballocators::LargeObjectAllocator::ObjectIterator;
+          return reinterpret_cast<I const &>(base_iterator) ==
+                 reinterpret_cast<I const &>(other.base_iterator);
+        }
+      } else {
+        return true;
+      }
+    }
+
+    bool operator!=(ObjectIterator const &other) const {
+      return !(*this == other);
+    }
+  };
+
   static constexpr const auto unlimitedQuarantine =
       Control::unlimitedQuarantine;
 
@@ -137,6 +433,8 @@ public:
   }
 
   Allocator() = default;
+
+  int ptr2bin(void *p) { return control->convertPtrToBinIndex(p); }
 
   Allocator(Allocator const &rhs)
       : control(rhs.control), largeObjectBin(rhs.largeObjectBin) {
@@ -257,13 +555,9 @@ public:
 
   explicit operator bool() const noexcept { return !control.isNull(); }
 
-  Mapping &getMapping() noexcept {
-    return control->mapping;
-  }
+  Mapping &getMapping() noexcept { return control->mapping; }
 
-  Mapping const &getMapping() const noexcept {
-    return control->mapping;
-  }
+  Mapping const &getMapping() const noexcept { return control->mapping; }
 
   [[nodiscard]] void *allocate(std::size_t size) {
     assert(*this && "Invalid allocator");
@@ -391,6 +685,12 @@ public:
     }
 
     return LocationInfo::LI_NonNullOutsideMapping;
+  }
+
+  ObjectIterator objects_begin() const noexcept { return {this, 0}; }
+
+  ObjectIterator objects_end() const noexcept {
+    return {this, Control::meta.size() + 1};
   }
 };
 
