@@ -38,7 +38,7 @@ index 0e7250a8fa10..e34ad010a933 100644
  append_list_if(COMPILER_RT_HAS_LIBDL dl ASAN_DYNAMIC_LIBS)
  append_list_if(COMPILER_RT_HAS_LIBRT rt ASAN_DYNAMIC_LIBS)
 diff --git a/compiler-rt/lib/asan/asan_allocator.cpp b/compiler-rt/lib/asan/asan_allocator.cpp
-index f9f1cfcd9f87..18c14947b789 100644
+index f9f1cfcd9f87..004565cc96e1 100644
 --- a/compiler-rt/lib/asan/asan_allocator.cpp
 +++ b/compiler-rt/lib/asan/asan_allocator.cpp
 @@ -25,10 +25,11 @@
@@ -247,7 +247,7 @@ index f9f1cfcd9f87..18c14947b789 100644
 +      fh->Parse(kdalloc_quarantine);
 +      Report("Using KDALLOC_QUARANTINE: 0x%zx\n", quarantine);
 +    }
-+    allocator.InitLinkerInitialized(address, size, quarantine);
++    allocator.InitLinkerInitialized(address, size, quarantine, kChunkHeaderSize);
      SharedInitCode(options);
      max_user_defined_malloc_size = common_flags()->max_allocation_size_mb
                                         ? common_flags()->max_allocation_size_mb

@@ -7,6 +7,7 @@
 
 namespace klee {
 
+__sanitizer::uptr KDAllocAsan::_kChunkHeaderSize = 0;
 bool KDAllocAsan::inKDAllocAsan = false;
 
 void *KDAllocAsan::Allocate(AllocatorCache *cache, __sanitizer::uptr size,
@@ -43,8 +44,9 @@ void *KDAllocAsan::Reallocate(AllocatorCache *cache, void *p,
 
 void KDAllocAsan::InitLinkerInitialized(__sanitizer::uptr address,
                                         __sanitizer::uptr size,
-                                        __sanitizer::u32 quarantine) {
-
+                                        __sanitizer::u32 quarantine,
+                                        __sanitizer::uptr kChunkHeaderSize) {
+  _kChunkHeaderSize = kChunkHeaderSize;
   inKDAllocAsan = true;
   allocator = new kdalloc::Allocator(
       klee::kdalloc::AllocatorFactory(address, size, quarantine)
@@ -61,7 +63,12 @@ __sanitizer::uptr KDAllocAsan::GetActuallyAllocatedSize(void *p) {
 
 void KDAllocAsan::ForEachChunk(__sanitizer::ForEachChunkCallback callback,
                                void *arg) {
-  assert(0 && "not supported");
+  for (auto it = allocator->objects_begin(), ie = allocator->objects_end();
+       it != ie; ++it) {
+    __sanitizer::uptr chunk =
+        reinterpret_cast<__sanitizer::uptr>(*it) - _kChunkHeaderSize;
+    callback(chunk, arg);
+  }
 }
 
 bool KDAllocAsan::PointerIsMine(const void *p) const {

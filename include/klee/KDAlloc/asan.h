@@ -18,7 +18,7 @@ class Allocator;
 }
 
 class KDAllocAsan {
-
+  static __sanitizer::uptr _kChunkHeaderSize;
 public:
   static bool inKDAllocAsan;
 
@@ -36,7 +36,8 @@ public:
                    __sanitizer::uptr alignment);
 
   void InitLinkerInitialized(__sanitizer::uptr address, __sanitizer::uptr size,
-                             __sanitizer::u32 quarantine);
+                             __sanitizer::u32 quarantine,
+                             __sanitizer::uptr kChunkHeaderSize);
 
   __sanitizer::uptr GetActuallyAllocatedSize(void *p);
 

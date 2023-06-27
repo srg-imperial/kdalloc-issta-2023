@@ -64,7 +64,6 @@ The patched ASan version respects the following environment variables:
 Due to the prototype nature of our patch, there are several known limitiations:
 
 * Only shared-library runtime is supported; use `-shared-libsan`!
-* Some `ASAN_OPTIONS` are unsupported, e.g. `detect_leaks=1` and `start_deactivated=1`
 * Some standard ASan settings are ignored (e.g. `quarantine_size_mb`); use `KDALLOC_` environment variables instead!
 * KDAlloc (huge) redzones are only partially poisoned (but we poison at least as much as vanilla ASan would)
 * No multithreading support
