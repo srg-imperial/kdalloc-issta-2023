@@ -82,10 +82,14 @@ bool KDAllocAsan::PointerIsMine(const void *p) const {
 
 /// return start of allocation `p` points into, `nullptr` otherwise
 void *KDAllocAsan::GetBlockBegin(const void *p) {
+  void *result = nullptr;
   inKDAllocAsan = true;
-  auto res = allocator->locationInfo(p, 1).getBaseAddress();
+  auto location_info = allocator->locationInfo(p, 1);
+  if (location_info == klee::kdalloc::LocationInfo::LI_AllocatedOrQuarantined) {
+    result = location_info.getBaseAddress();
+  }
   inKDAllocAsan = false;
-  return res;
+  return result;
 }
 
 } // namespace klee
