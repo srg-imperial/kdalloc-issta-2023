@@ -14,6 +14,7 @@
 #include "gtest/gtest.h"
 #endif
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -23,6 +24,8 @@
 #include <random>
 #include <utility>
 #include <vector>
+
+#include <set>
 
 namespace {
 class RandomTest {
@@ -61,6 +64,17 @@ public:
         deallocate();
       }
     }
+
+#if defined(USE_KDALLOC)
+    std::sort(allocations.begin(), allocations.end());
+    std::set<void *> objects(allocator.objects_begin(),
+                             allocator.objects_end());
+    assert(std::equal(allocations.begin(), allocations.end(), objects.begin(),
+                      objects.end(),
+                      [](std::pair<void *, std::size_t> const &lhs,
+                         void *const &rhs) { return lhs.first == rhs; }));
+#endif
+
     cleanup();
   }
 
