@@ -82,17 +82,29 @@ public:
     while (!allocations.empty()) {
       auto choice = std::uniform_int_distribution<std::size_t>(
           0, allocations.size() - 1)(rng);
+      auto size = allocator.getSize(allocations[choice].first);
+      assert(allocations[choice].second <= size);
+      assert(((allocations[choice].second + 4095) / 4096) * 4096 >= size);
       assert(allocator.locationInfo(allocations[choice].first, 1) ==
              klee::kdalloc::LocationInfo::LI_AllocatedOrQuarantined);
       assert(allocator.locationInfo(allocations[choice].first,
-                                    allocations[choice].second) ==
+                                     allocations[choice].second) ==
              klee::kdalloc::LocationInfo::LI_AllocatedOrQuarantined);
+      assert(allocator.locationInfo(
+                 static_cast<char const *>(allocations[choice].first) - 1, 1) !=
+             klee::kdalloc::LocationInfo::LI_AllocatedOrQuarantined);
+      assert(allocator.locationInfo(
+                 static_cast<char const *>(allocations[choice].first) + size,
+                 1) != klee::kdalloc::LocationInfo::LI_AllocatedOrQuarantined);
+
       allocator.free(allocations[choice].first, allocations[choice].second);
+
       assert(allocator.locationInfo(allocations[choice].first, 1) ==
              klee::kdalloc::LocationInfo::LI_Unallocated);
       assert(allocator.locationInfo(allocations[choice].first,
-                                    allocations[choice].second) ==
+                                     allocations[choice].second) ==
              klee::kdalloc::LocationInfo::LI_Unallocated);
+
       allocations[choice] = allocations.back();
       allocations.pop_back();
     }
