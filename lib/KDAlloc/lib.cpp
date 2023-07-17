@@ -188,31 +188,34 @@ EXPORT void kdalloc_underlying_free(void *p) noexcept {
 }
 
 EXPORT void *malloc(std::size_t size) noexcept {
+  util::log("malloc("sv, size, ")"sv);
+
   std::scoped_lock lock(global_lock);
   if (kdalloc_is_active) {
     kdalloc_is_active = false;
     kdalloc_is_nested = true;
 
-    util::log("kdalloc malloc("sv, size, ")"sv);
+    util::log(" as kdalloc -> "sv);
     auto *result = heap->allocate(size);
-    util::log(" -> "sv, result, "\n"sv);
+    util::log(result, "\n"sv);
 
     kdalloc_is_nested = false;
     kdalloc_is_active = true;
     return result;
   } else {
-    if (!kdalloc_is_nested) {
-      util::log("underlying malloc("sv, size, ")"sv);
+    if (kdalloc_is_nested) {
+      util::log(" as nested -> "sv);
+    } else {
+      util::log(" as underlying -> "sv);
     }
     auto *result = underlying.malloc(size);
-    if (!kdalloc_is_nested) {
-      util::log(" -> "sv, result, "\n"sv);
-    }
+    util::log(result, "\n"sv);
     return result;
   }
 }
 
 EXPORT void *calloc(std::size_t n, std::size_t size) noexcept {
+  util::log("calloc("sv, n, ", "sv, size, ")"sv);
   assert((n * size) / size == n && "overflow in calloc arguments");
 
   std::scoped_lock lock(global_lock);
@@ -220,72 +223,80 @@ EXPORT void *calloc(std::size_t n, std::size_t size) noexcept {
     kdalloc_is_active = false;
     kdalloc_is_nested = true;
 
-    util::log("kdalloc calloc("sv, n, ", "sv, size, ")"sv);
+    util::log(" as kdalloc -> "sv);
     auto *result = heap->allocate(size);
-    std::memset(result, 1, n * size);
-    util::log(" -> "sv, result, "\n"sv);
+    std::memset(result, 0, n * size);
+    util::log(result, "\n"sv);
 
     kdalloc_is_nested = false;
     kdalloc_is_active = true;
     return result;
   } else {
-    if (!kdalloc_is_nested) {
-      util::log("underlying calloc("sv, n, ", "sv, size, ")"sv);
+    if (kdalloc_is_nested) {
+      util::log(" as nested -> "sv);
+    } else {
+      util::log(" as underlying -> "sv);
     }
     auto *result = underlying.calloc(n, size);
-    if (!kdalloc_is_nested) {
-      util::log(" -> "sv, result, "\n"sv);
-    }
+    util::log(result, "\n"sv);
     return result;
   }
 }
 
 EXPORT void *realloc(void *p, std::size_t size) noexcept {
+  util::log("realloc("sv, p, ", "sv, size, ")"sv);
+
   std::scoped_lock lock(global_lock);
   if (kdalloc_is_active) {
     kdalloc_is_active = false;
     kdalloc_is_nested = true;
 
-    util::log("kdalloc realloc("sv, p, ", "sv, size, ")"sv);
+    util::log(" as kdalloc -> "sv);
     auto old_size = heap->getSize(p);
     auto result = heap->allocate(size);
     std::memcpy(result, p, std::min(size, old_size));
     heap->free(p);
-    util::log(" -> "sv, result, "\n"sv);
+    util::log(result, "\n"sv);
 
     kdalloc_is_nested = false;
     kdalloc_is_active = true;
     return result;
   } else {
-    if (!kdalloc_is_nested) {
-      util::log("underlying realloc("sv, p, ", "sv, size, ")"sv);
+    if (kdalloc_is_nested) {
+      util::log(" as nested -> "sv);
+    } else {
+      util::log(" as underlying -> "sv);
     }
     auto *result = underlying.realloc(p, size);
-    if (!kdalloc_is_nested) {
-      util::log(" -> "sv, result, "\n"sv);
-    }
+    util::log(result, "\n"sv);
     return result;
   }
 }
 
 EXPORT void free(void *p) noexcept {
+  util::log("free("sv, p, ")\n"sv);
+
   std::scoped_lock lock(global_lock);
   if (kdalloc_is_active) {
     kdalloc_is_active = false;
     kdalloc_is_nested = true;
 
-    util::log("kdalloc free("sv, p, ")\n"sv);
+    util::log(" as kdalloc -> "sv);
     if (p) {
       heap->free(p);
     }
 
     kdalloc_is_nested = false;
     kdalloc_is_active = true;
+    util::log("Ok\n");
   } else {
-    if (!kdalloc_is_nested) {
-      util::log("underlying free("sv, p, ")\n"sv);
+    if (kdalloc_is_nested) {
+      util::log(" as nested -> "sv);
+    } else {
+      util::log(" as underlying -> "sv);
     }
     underlying.free(p);
+    util::log("Ok\n");
   }
 }
 }
